@@ -1,0 +1,31 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "input-space-gradient"
+version = "0.1.0"
+description = "A Python project"
+authors = ["Kyle Pena <kp1197@gmail.com"]
+readme = "README.md"
+packages = [{include = "input_space_gradient"}]
+repository = "https://github.com/username/input-space-gradient.git"
+homepage = "https://github.com/username/input-space-gradient"
+
+[tool.poetry.dependencies]
+python = ">=3.12"
+fastapi = "0.115.12"
+uvicorn = "0.34.3"
+torch = "2.7.0"
+notebook = "7.4.3"
+matplotlib = "3.10.3"
+vec2text = "^0.0.13"
+ipykernel = "^6.29.5"
+bertviz = "^1.4.1"
+jupyterlab = "^4.4.3"
+ipywidgets = "^8.1.7"
+faiss-cpu = "^1.11.0"
+cloudpickle = "^3.1.1"
+umap-learn = "^0.5.7"
+pre-commit = "^4.2.0"
+nbstripout = "^0.8.1"

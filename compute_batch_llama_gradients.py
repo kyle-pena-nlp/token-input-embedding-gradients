@@ -10,8 +10,7 @@ from llama_models import (
     tokenizer,
     full_vocab_embedding,
     full_vocab_embedding_torch,
-    vocab_embedding_no_special_tokens,
-    vocab_embeddings_norm
+    vocab_embedding_no_special_tokens
 )
 
 @dataclass
@@ -35,7 +34,7 @@ class BatchArgs:
     no_ADAM : bool = False
     min_num_words : Optional[int] = None
     randomize_input_embeds : bool = False
-
+    trim_input_ids : bool = False
     # populated by learn_embeddings
     sentences : Optional[list[str]] = None
     tokenization : Optional[Any] = None
@@ -50,7 +49,7 @@ class BatchArgs:
         return BatchArgs(**self.__dict__)
 
     def __repr__(self):
-        repr_keys = ["steps", "learning_rate", "examples_filepath", "num_examples", "example_stride", "permutation_seed", "masked_sentences_seed", "no_ADAM", "min_num_words", "randomize_input_embeds"]
+        repr_keys = ["steps", "learning_rate", "examples_filepath", "num_examples", "example_stride", "permutation_seed", "masked_sentences_seed", "no_ADAM", "min_num_words", "randomize_input_embeds", "trim_input_ids"]
         values = "\n,".join([f"{key} = {value}" for key, value in self.__dict__.items() if key in repr_keys])
         return f"BatchArgs(\n{values}\n)"
 
@@ -72,7 +71,8 @@ def assign_target_probabilities(args : BatchArgs):
         N = len(args.sentences)
         permutation = np.random.permutation(N)
         results = model(**tokenizations)
-        target_probs = results.logits.softmax(dim=2)
+        target_probs = results.logits[:, -1, :]
+        target_probs = target_probs.softmax(dim=1)
         target_probs = target_probs[permutation]
 
     if args.scramble_target_probs:
@@ -80,7 +80,8 @@ def assign_target_probabilities(args : BatchArgs):
         rng = np.random.default_rng(args.permutation_seed + 1)
         rng.shuffle(target_probs, axis=1)
 
-    target_probs = target_probs.detach().clone().numpy()
+    if isinstance(target_probs, torch.Tensor):
+        target_probs = target_probs.detach().clone().numpy()
     args.target_probabilities = target_probs
     args.sentence_permutation = permutation
 
@@ -89,13 +90,16 @@ def tokenize_sentences(args : BatchArgs):
     # Run tokenization
     print(f"Tokenizing {len(args.sentences)} sentences")
     args.tokenization = tokenizer(args.sentences, return_tensors="pt", padding=True)
+    if args.trim_input_ids:
+        args.tokenization['input_ids'] = args.tokenization['input_ids'][:,:-3] # Trim so there is something meaningful to predict.
     args.tokenized_no_input_ids = { key: value for (key,value) in args.tokenization.items() if key != "input_ids"}
 
 
 
 def read_sentences(args : BatchArgs):
-    if isinstance(args.examples_filepath, list):
-        return args.examples_filepath
+    if isinstance(args.examples_filepath, list) and len(args.examples_filepath) > 0 and all([isinstance(x, str) for x in args.examples_filepath]):
+        args.sentences = args.examples_filepath
+        return
     sentences = []
     with open(args.examples_filepath, "r") as f:
         print("Reading sentences")
@@ -118,14 +122,14 @@ def read_sentences(args : BatchArgs):
 def get_batch_inputs_embeds(args : BatchArgs):
     print("Creating input embeds")
     tokenization = args.tokenization
-    inputs_embeds = model.model.embeddings.tok_embeddings(tokenization['input_ids'])
+    inputs_embeds = model.model.embed_tokens(tokenization['input_ids'])
     if args.randomize_input_embeds:
-        no_special_token_idxs = [ i for i in range(len(full_vocab_embedding_torch)) if i not in tokenizer.all_special_tokens ]
+        no_special_token_idxs = [ i for i in range(len(full_vocab_embedding_torch)) if i not in tokenizer.all_special_ids ]
         full_vocab_embedding_no_special_tokens = full_vocab_embedding_torch[no_special_token_idxs]
         full_vocab_embedding_means = torch.mean(full_vocab_embedding_no_special_tokens, dim=0, keepdim=True)
         full_vocab_embedding_stdevs = torch.std(full_vocab_embedding_no_special_tokens - full_vocab_embedding_means, dim=0, keepdim=True)
         is_special_token_mask = torch.zeros_like(tokenization['input_ids'], dtype=torch.float)
-        for special_token_id in tokenizer.all_special_tokens:
+        for special_token_id in tokenizer.all_special_ids:
             is_special_token_mask[tokenization['input_ids'] == special_token_id] = 1
         torch.manual_seed(args.permutation_seed)
         random_input_embeds = torch.randn_like(inputs_embeds) * full_vocab_embedding_stdevs.unsqueeze(0) + full_vocab_embedding_means.unsqueeze(0)
@@ -138,7 +142,7 @@ def get_batch_gradient_masks(args : BatchArgs):
     tokenization = args.tokenization
     gradient_masks = []
     for input_ids in tokenization['input_ids']:
-        gradient_mask = np.array([int(input_id not in tokenizer.all_special_tokens) for input_id in input_ids.tolist()])
+        gradient_mask = np.array([int(input_id not in tokenizer.all_special_ids) for input_id in input_ids.tolist()])
         gradient_masks.append(gradient_mask)
     args.gradient_masks = np.asarray(gradient_masks, dtype=float)
 
@@ -148,16 +152,20 @@ def compute_batch_inputs_embeds_gradients(args : BatchInputsEmbedsGradArgs):
     tokenized_no_input_ids = args.tokenized_no_input_ids
     inputs_embeds = args.inputs_embeds
     target_probabilities = args.target_probabilities
-    mask_positions = args.mask_positions
     N = args.N
 
     # Run a forward pass on the model
     model_result = model(**tokenized_no_input_ids, inputs_embeds=inputs_embeds)
-    masked_token_logits = model_result.logits[N, mask_positions, :]
+    next_token_logits = model_result.logits[:,-1,:]
+
+    print("next_token_logits.shape", next_token_logits.shape)
+    print("target_probabilities.shape", target_probabilities.shape)
 
     # Calculate cross entropy loss WRT desired probability distribution
     loss_fn = nn.CrossEntropyLoss()
-    loss = loss_fn(masked_token_logits, target_probabilities)
+    loss = loss_fn(next_token_logits, target_probabilities)
+
+
 
     inputs_embeds_grad = torch.autograd.grad(
         outputs=loss,
@@ -172,6 +180,7 @@ def compute_batch_inputs_embeds_gradients(args : BatchInputsEmbedsGradArgs):
 
     return loss, inputs_embeds_grad
 
+
 def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
 
     # Prepare data
@@ -185,7 +194,6 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
     inputs_embeds = torch.Tensor(args.inputs_embeds).requires_grad_(True)
     initial_inputs_embeds = torch.Tensor(args.inputs_embeds).detach().clone()
     target_probabilities = torch.Tensor(args.target_probabilities)
-    mask_positions = torch.tensor(args.mask_positions, dtype=torch.long)
     gradient_masks = torch.tensor(args.gradient_masks, dtype=torch.float).unsqueeze(-1)
     N = torch.arange(len(args.sentences))
 
@@ -206,11 +214,7 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
             initial_inputs_embeds = initial_inputs_embeds,
             inputs_embeds = inputs_embeds,
             target_probabilities = target_probabilities,
-            mask_positions = mask_positions,
-            N = N,
-            l1_lambda = args.l1_lambda,
-            basin_loss_lambda = args.basin_loss_lambda,
-            cosine_dist_lambda = args.cosine_dist_lambda
+            N = N
         ))
         with torch.no_grad():
             if args.no_ADAM:

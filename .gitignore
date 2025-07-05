@@ -3,3 +3,4 @@ __pycache__
 .ipynb.swp
 
 eng_sentences.tsv
+*.p

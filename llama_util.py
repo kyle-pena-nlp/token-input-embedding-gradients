@@ -3,6 +3,7 @@ import numpy as np
 import sklearn.preprocessing
 from compute_batch_bert_gradients import BatchArgs
 from llama_models import (
+    device,
     model,
     tokenizer,
     full_vocab_embedding_normalized
@@ -68,9 +69,10 @@ def calculate_token_probabilities(args : BatchArgs, inputs_embeds : torch.Tensor
 
 def get_token_distribution(sentences : list[str]):
     tokenized = tokenizer(sentences, return_tensors="pt")
+    tokenized = { key: value.to(device) for (key,value) in tokenized.items() }
     model_result = model(**tokenized)
     probs = model_result.logits[:, -1, :].softmax(dim=1)
-    return probs.detach().clone().numpy()
+    return probs.detach().clone().cpu().numpy()
 
 def compute_divergence(args: BatchArgs, input_embeds : np.ndarray, target_probs : np.ndarray):
     if not isinstance(input_embeds, torch.Tensor):

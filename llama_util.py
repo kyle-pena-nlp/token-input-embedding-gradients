@@ -61,11 +61,11 @@ def invert_embeddings(inputs_embeds):
 
 def calculate_token_probabilities(args : BatchArgs, inputs_embeds : torch.Tensor):
     if not isinstance(inputs_embeds, torch.Tensor):
-        inputs_embeds = torch.Tensor(inputs_embeds)
+        inputs_embeds = torch.tensor(inputs_embeds, device=device)
     model_result = model(**args.tokenized_no_input_ids, inputs_embeds=inputs_embeds) # [B,N,V]
     probs = model_result.logits.softmax(dim=2)
     masked_token_probs = probs[torch.arange(len(probs)), -1, :]
-    return masked_token_probs.detach().clone().numpy()
+    return masked_token_probs.detach().clone().cpu().numpy()
 
 def get_token_distribution(sentences : list[str]):
     tokenized = tokenizer(sentences, return_tensors="pt")

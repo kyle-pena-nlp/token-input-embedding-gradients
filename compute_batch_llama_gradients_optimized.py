@@ -121,6 +121,7 @@ def read_sentences(args : BatchArgs):
                 continue
             offset += 1
             if offset < args.start_offset:
+                print(f"Skipping {offset} lines")
                 continue
             i += 1
             if i % args.example_stride != 0:

@@ -107,6 +107,11 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
     scaler = torch.amp.GradScaler()   # built-in utility
     opt = torch.optim.Adam([inputs_embeds], lr=learning_rate)
     ts = time.time()
+
+    # Track which examples are still being optimized
+    batch_size = inputs_embeds.shape[0]
+    active_examples = torch.ones(batch_size, dtype=torch.bool, device=device)
+
     for t in range(args.max_iters):
         opt.zero_grad(set_to_none=True)
         with torch.autocast("mps", dtype=torch.float16):
@@ -114,21 +119,45 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
                 attention_mask = attention_mask,
                 position_ids = position_ids,
                 inputs_embeds=inputs_embeds).logits[:, -1, :]
-            loss = F.kl_div(F.log_softmax(logits, -1), target_probabilities, reduction='batchmean')
+
+            # Compute per-example KL divergence
+            # To verify: is the last dimension prior to .sum(dim=-1) actual vocab dim?
+            kl_per_example = F.kl_div(F.log_softmax(logits, -1), target_probabilities, reduction='none').sum(dim=-1)
+            print(kl_per_example.shape)
+
+            # Overall loss for backward pass (only for logging/backward)
+            loss = kl_per_example.mean()
+
         scaler.scale(loss).backward()
         inputs_embeds.grad.mul_(gradient_masks)           # mask specials
+
+        # Zero out gradients for examples below epsilon
+        with torch.no_grad():
+            below_epsilon = kl_per_example < args.epsilon
+            active_examples = active_examples & (~below_epsilon)
+
+            # Create per-example mask (batch_size, 1, 1) to mask all tokens in frozen examples
+            example_mask = active_examples.float().view(batch_size, 1, 1)
+            inputs_embeds.grad.mul_(example_mask)
+
         scaler.step(opt)
         scaler.update()
 
         # lightweight logging every 10 iters
         if t % 10 == 0:
             torch.mps.synchronize()
-            print(f"step {t:4d}   loss {loss.item():.4f} ({(time.time() - ts)/10:.2f} seconds per step)")
+            num_active = active_examples.sum().item()
+            print(f"step {t:4d}   loss {loss.item():.4f}   active: {num_active}/{batch_size}   ({(time.time() - ts)/10:.2f} seconds per step)")
             ts = time.time()
 
         # occasional allocator clean-up
         if t % 100 == 0:
             torch.mps.empty_cache()
+
+        # Early termination when all examples are below epsilon
+        if not active_examples.any():
+            print(f"Early termination at step {t}: all examples below epsilon={args.epsilon}")
+            break
 
     return LearnEmbeddingsResult(
         inputs_embeds = inputs_embeds.detach().clone().cpu().numpy()

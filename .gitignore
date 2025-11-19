@@ -4,3 +4,5 @@ __pycache__
 
 eng_sentences.tsv
 *.p
+.DS_Store
+results/

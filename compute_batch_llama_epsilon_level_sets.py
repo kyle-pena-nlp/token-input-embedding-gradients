@@ -8,19 +8,17 @@ import time
 from llama_models import (
     device,
     model,
-    tokenizer
+    tokenizer,
+    full_vocab_embedding
 )
 import torch.nn.functional as F
+from scipy import linalg
 
 MOCK_TOKEN = "dog"
 
 @dataclass
 class BatchArgs:
-    max_iters: int = 100
-    learning_rate : float = 1e-3
 
-    # What level-set we are gradient-descent converging to
-    epsilon : float = 1e-6
 
     # Token embeddings over a batch of tokens (Batch x Seq x Dim)
     inputs_embeds : torch.Tensor
@@ -28,13 +26,20 @@ class BatchArgs:
     # What we are converging to
     target_probabilities : list[torch.Tensor]
 
-@dataclass
-class GradientDescentBatchArgs:
     max_iters: int = 100
+
     learning_rate : float = 1e-3
 
     # What level-set we are gradient-descent converging to
-    epsilon : float = 1e-2
+    epsilon : float = 1e-6
+
+@dataclass
+class GradientDescentBatchArgs:
+    max_iters: int
+    learning_rate : float
+
+    # What level-set we are gradient-descent converging to
+    epsilon : float
 
     # Token embeddings over a batch of tokens (Batch x Seq x Dim)
     inputs_embeds : torch.Tensor
@@ -65,7 +70,9 @@ class GradientDescentBatchArgs:
 class LearnEmbeddingsResult:
     inputs_embeds : np.ndarray
     previous_inputs_embeds : np.ndarray  # second-to-final embeddings
-
+    refined_embeds : np.ndarray
+    converged : np.ndarray  # Boolean array indicating which examples converged (KL < epsilon)
+    refinement_success : np.ndarray  # Boolean array indicating refinement success (abs(kl - epsilon) < threshold)
 
 def create_gradient_descent_batch_args(args: BatchArgs) -> GradientDescentBatchArgs:
 
@@ -169,20 +176,26 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
             break
 
     # Refinement pass to get closer to epsilon-level set
-    print("Refining embeddings to epsilon-level set...")
-    refined_embeds = refine_to_epsilon_level_set(
+    print("Refining converged (KL < epsilon) embeddings to epsilon-level set...")
+
+    converged = ~active_examples
+    refined_embeds, refined = refine_to_epsilon_level_set(
         model=model,
         previous_embeds=previous_inputs_embeds,
         final_embeds=inputs_embeds.detach(),
         target_probs=target_probabilities,
         epsilon=args.epsilon,
         attention_mask=attention_mask,
-        position_ids=position_ids
+        position_ids=position_ids,
+        converged = converged
     )
 
     return LearnEmbeddingsResult(
-        inputs_embeds = refined_embeds.cpu().numpy(),
-        previous_inputs_embeds = previous_inputs_embeds.detach().clone().cpu().numpy()
+        inputs_embeds = inputs_embeds.detach().clone().cpu().numpy(),
+        previous_inputs_embeds = previous_inputs_embeds.detach().clone().cpu().numpy(),
+        refined_embeds = refined_embeds.detach().clone().cpu().numpy(),
+        converged = converged.cpu().numpy(),
+        refinement_success = refined.cpu().numpy()
     )
 
 
@@ -195,7 +208,8 @@ def refine_to_epsilon_level_set(
     attention_mask,
     position_ids,
     max_iters=20,
-    tolerance=1e-7
+    tolerance=None,
+    converged=None
 ):
     """Binary search between previous and final embeddings to find KL ≈ epsilon.
 
@@ -209,14 +223,26 @@ def refine_to_epsilon_level_set(
         position_ids: Position IDs for the model
         max_iters: Maximum binary search iterations per example
         tolerance: Convergence tolerance for KL divergence
+        converged: Boolean tensor indicating which examples converged (optional)
 
     Returns:
-        Refined embeddings with KL ≈ epsilon
+        Tuple of (refined_embeds, success_indicators) where success_indicators
+        is a boolean tensor indicating which examples met the threshold
     """
+
+    if tolerance is None:
+        tolerance = epsilon / 1000
+
     batch_size = final_embeds.shape[0]
     refined_embeds = final_embeds.clone()
 
-    for batch_idx in range(batch_size):
+    # Only refine examples that converged
+    if converged is None:
+        converged = torch.ones(batch_size, dtype=torch.bool, device=final_embeds.device)
+
+    examples_to_refine = torch.where(converged)[0]
+
+    for batch_idx in examples_to_refine:
         # Binary search for interpolation parameter α
         alpha_low, alpha_high = 0.0, 1.0  # 0=final, 1=previous
         best_alpha = 0.0
@@ -270,7 +296,31 @@ def refine_to_epsilon_level_set(
         # Apply best interpolation
         refined_embeds[batch_idx] = ((1 - alpha) * final_embeds[batch_idx] + alpha * previous_embeds[batch_idx])
 
-    return refined_embeds
+    # Final forward pass to compute success indicators for all examples at once
+    print("Computing final KL divergences for all examples...")
+    with torch.no_grad():
+        logits = model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=refined_embeds
+        ).logits[:, -1, :]
+
+        final_kl = F.kl_div(
+            F.log_softmax(logits, -1),
+            target_probs,
+            reduction='none'
+        ).sum(dim=-1)
+
+        # Success indicator: abs(kl - epsilon) < tolerance
+        success_indicators = torch.abs(final_kl - epsilon) < tolerance
+
+        # Log summary
+        num_successful = success_indicators.sum().item()
+        print(f"  Refinement summary: {num_successful}/{batch_size} examples met threshold")
+        print(f"  Mean KL diff from epsilon: {torch.abs(final_kl - epsilon).mean().item():.2e}")
+        print(f"  Max KL diff from epsilon: {torch.abs(final_kl - epsilon).max().item():.2e}")
+
+    return refined_embeds, success_indicators
 
 
 def timer(func):
@@ -281,3 +331,78 @@ def timer(func):
         print(f"{func.__name__ if hasattr(func, '__name__') else func.__class__.__name__} took {end - start} seconds")
         return result
     return wrapper
+
+
+def fit_gaussian_ellipse_and_sample(
+    embeddings: np.ndarray,
+    n_samples: int,
+    confidence_level: float = 0.99,
+    random_seed: Optional[int] = None
+) -> np.ndarray:
+    """Fit a Gaussian ellipse to embeddings and sample uniformly within it.
+
+    Args:
+        embeddings: Embedding matrix of shape (n_embeddings, embedding_dim)
+        n_samples: Number of samples to generate
+        confidence_level: Confidence level for the ellipse bounds (default: 0.99)
+        random_seed: Random seed for reproducibility
+
+    Returns:
+        Sampled embeddings of shape (n_samples, embedding_dim) within the ellipse
+    """
+    if random_seed is not None:
+        np.random.seed(random_seed)
+
+    # Fit Gaussian: compute mean and covariance
+    mean = np.mean(embeddings, axis=0)
+    centered = embeddings - mean
+    cov = np.cov(centered.T)
+
+    # Eigendecomposition for the ellipse
+    eigenvalues, eigenvectors = linalg.eigh(cov)
+
+    # Chi-squared quantile for multivariate Gaussian at given confidence level
+    from scipy.stats import chi2
+    dim = embeddings.shape[1]
+    chi2_val = chi2.ppf(confidence_level, df=dim)
+
+    # Scale eigenvalues by chi-squared quantile
+    scaled_radii = np.sqrt(eigenvalues * chi2_val)
+
+    # Sample uniformly within unit sphere, then transform to ellipse
+    samples = []
+    while len(samples) < n_samples:
+        # Sample from unit sphere using rejection sampling
+        candidate = np.random.randn(dim)
+        norm = np.linalg.norm(candidate)
+
+        if norm > 0:
+            # Uniform in unit ball: scale by u^(1/dim) where u ~ Uniform(0,1)
+            u = np.random.uniform(0, 1)
+            radius = u ** (1.0 / dim)
+            unit_sample = (candidate / norm) * radius
+
+            # Transform to ellipse: scale by eigenvalues and rotate by eigenvectors
+            ellipse_sample = mean + eigenvectors @ (scaled_radii * unit_sample)
+            samples.append(ellipse_sample)
+
+    return np.array(samples)
+
+
+def sample_vocab_ellipse(n_samples: int, confidence_level: float = 0.99, random_seed: Optional[int] = None) -> np.ndarray:
+    """Sample embeddings uniformly within the Gaussian ellipse of the vocabulary.
+
+    Args:
+        n_samples: Number of samples to generate
+        confidence_level: Confidence level for the ellipse bounds (default: 0.99)
+        random_seed: Random seed for reproducibility
+
+    Returns:
+        Sampled embeddings of shape (n_samples, embedding_dim)
+    """
+    return fit_gaussian_ellipse_and_sample(
+        embeddings=full_vocab_embedding,
+        n_samples=n_samples,
+        confidence_level=confidence_level,
+        random_seed=random_seed
+    )

@@ -245,37 +245,35 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
     losses_list = []
     reg_losses_list = []
     inputs_embeds_list = []
+
+    model.eval()                              # inference mode
+    model.requires_grad_(False)               # turn off grads for every param
+
+    scaler = torch.amp.GradScaler()   # built-in utility
+    opt = torch.optim.Adam([inputs_embeds], lr=learning_rate)
+    ts = time.time()
+
     while t < args.steps:
         t += 1
-        loss, gradient, reg_loss = fn(BatchInputsEmbedsGradArgs(
-            tokenized_no_input_ids = args.tokenized_no_input_ids,
-            initial_inputs_embeds = initial_inputs_embeds,
-            inputs_embeds = inputs_embeds,
-            target_probabilities = target_probabilities,
-            mask_positions = mask_positions,
-            N = N,
-            l1_lambda = args.l1_lambda,
-            basin_loss_lambda = args.basin_loss_lambda,
-            cosine_dist_lambda = args.cosine_dist_lambda
-        ))
-        with torch.no_grad():
-            if args.no_ADAM:
-                inputs_embeds -= args.learning_rate * gradient * gradient_masks
-            else:
-                m = B1 * m + (1 - B1) * gradient
-                v = B2 * v + (1 - B2) * gradient**2
-                m_hat = m / (1 - B1**t)
-                v_hat = v / (1 - B2**t)
-                inputs_embeds -= gradient_masks * learning_rate * m_hat / (torch.sqrt(v_hat) + 1e-8)
-            inputs_embeds.grad = None
-        print(t, loss.item(), f"{reg_loss.item():.6f}")
+        opt.zero_grad(set_to_none=True)
+
+        with torch.autocast("mps", dtype=torch.float16):
+            logits = model(**args.tokenized_no_input_ids,
+                        inputs_embeds=inputs_embeds).logits[:, -1, :]
+            loss = F.kl_div(F.log_softmax(logits, -1), target_probabilities, reduction='batchmean')
+            reg_loss = args.L1_embed_loss * inputs_embeds.abs().mean()
+            loss += reg_loss
+        scaler.scale(loss).backward()
+        inputs_embeds.grad.mul_(gradient_masks)           # mask specials
+        scaler.step(opt)
+        scaler.update()
 
         # Bookkeeping
         losses_list.append(loss.item())
         reg_losses_list.append(reg_loss.item())
-        inputs_embeds_list.append(inputs_embeds.detach().clone().numpy())
+        inputs_embeds_list.append(inputs_embeds.detach().clone().cpu().numpy())
 
-    last_gradient = gradient.detach().clone().numpy()
+    last_gradient = inputs_embeds.grad.detach().clone().cpu().numpy()
 
     return LearnEmbeddingsResult(
         losses_list = losses_list,

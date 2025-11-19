@@ -9,7 +9,7 @@ from llama_models import tokenizer
 
 def animate_kl_divergences(args : BatchArgs, probs_path : list[np.ndarray]):
     # Plot KL-Divergence over time
-    max_anim_steps = 250
+    max_anim_steps = 100
     kl_divergence = scipy.stats.entropy(probs_path, np.expand_dims(args.target_probabilities,0), axis = 2)
     frames = min(len(kl_divergence), max_anim_steps)
     xs = np.arange(len(kl_divergence)) # (500)
@@ -41,7 +41,7 @@ def animate_kl_divergences(args : BatchArgs, probs_path : list[np.ndarray]):
 
 def animate_sentence_level_L2_distances(args : BatchArgs, input_embeds_list : list[np.ndarray]):
 
-    max_anim_steps = 250
+    max_anim_steps = 100
     np_inputs_embeds_list = np.asarray(input_embeds_list)
     start_inputs_embeds = np.expand_dims(input_embeds_list[0], axis = 0)
     input_embeds_diffs = start_inputs_embeds - np_inputs_embeds_list
@@ -79,7 +79,7 @@ def animate_sentence_level_L2_distances(args : BatchArgs, input_embeds_list : li
 
 def animate_token_level_L2_distances(args : BatchArgs, input_embeds_list : list[np.ndarray], sentence_idx : int):
 
-    max_anim_steps = 250
+    max_anim_steps =  100
     np_inputs_embeds_list = np.asarray([x[sentence_idx,...] for x in input_embeds_list]) # [t,N,V]
     start_inputs_embeds = input_embeds_list[0] # [1,N,V]
     input_embeds_diffs = start_inputs_embeds - np_inputs_embeds_list # [t,N,V]

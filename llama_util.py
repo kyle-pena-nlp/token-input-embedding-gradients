@@ -17,7 +17,7 @@ def collect_probability_path(args : BatchArgs, input_embeds_list : list[np.ndarr
     target_probs = args.target_probabilities
     probs_path = np.zeros((len(input_embeds_list), target_probs.shape[0], target_probs.shape[-1]))
     for i in tqdm(range(len(input_embeds_list))):
-        p = calculate_token_probabilities(args, torch.Tensor(input_embeds_list[i]))
+        p = calculate_token_probabilities(args, torch.tensor(input_embeds_list[i], device=device))
         probs_path[i,:] = p
     return probs_path
 

@@ -13,6 +13,7 @@ from llama_models import (
 )
 import torch.nn.functional as F
 from scipy import linalg
+from torch_utils import synchronize, empty_cache, autocast
 
 MOCK_TOKEN = "dog"
 
@@ -33,6 +34,8 @@ class BatchArgs:
     # What level-set we are gradient-descent converging to
     epsilon : float = 1e-6
 
+    epsilon_tolerance_scale : float = 1e-2
+
 @dataclass
 class GradientDescentBatchArgs:
     max_iters: int
@@ -40,6 +43,8 @@ class GradientDescentBatchArgs:
 
     # What level-set we are gradient-descent converging to
     epsilon : float
+
+    epsilon_tolerance_scale : float
 
     # Token embeddings over a batch of tokens (Batch x Seq x Dim)
     inputs_embeds : torch.Tensor
@@ -54,7 +59,7 @@ class GradientDescentBatchArgs:
     attention_mask : torch.Tensor
 
     # position_ids
-    position_ids : torch.Tensor
+    #position_ids : torch.Tensor
 
 
 
@@ -62,17 +67,15 @@ class GradientDescentBatchArgs:
         return GradientDescentBatchArgs(**self.__dict__)
 
     def __repr__(self):
-        repr_keys = ["max_iters", "learning_rate", "epsilon"]
+        repr_keys = ["max_iters", "learning_rate", "epsilon", "epsilon_tolerance_scale"]
         values = "\n,".join([f"{key} = {value}" for key, value in self.__dict__.items() if key in repr_keys])
         return f"GradientDescentBatchArgs(\n{values}\n)"
 
 @dataclass
 class LearnEmbeddingsResult:
+    starting_inputs_embeds : np.ndarray
     inputs_embeds : np.ndarray
-    previous_inputs_embeds : np.ndarray  # second-to-final embeddings
-    refined_embeds : np.ndarray
     converged : np.ndarray  # Boolean array indicating which examples converged (KL < epsilon)
-    refinement_success : np.ndarray  # Boolean array indicating refinement success (abs(kl - epsilon) < threshold)
 
 def create_gradient_descent_batch_args(args: BatchArgs) -> GradientDescentBatchArgs:
 
@@ -85,14 +88,21 @@ def create_gradient_descent_batch_args(args: BatchArgs) -> GradientDescentBatchA
         gradient_masks.append(gradient_mask)
     gradient_masks = np.asarray(gradient_masks, dtype=float)
 
+    inputs_embeds = model.model.embed_tokens(mock_tokenization['input_ids'].to(device))
+
+    # The mock tokenization's embedding is going to have a special token (the start token) at the first position
+    # We swap that out with the inputs_emebds we provided in the BatchArgs
+    inputs_embeds[:,1,:] = torch.tensor(args.inputs_embeds, device = device)
+
     return GradientDescentBatchArgs(
         max_iters = args.max_iters,
         learning_rate = args.learning_rate,
         epsilon = args.epsilon,
-        inputs_embeds = args.inputs_embeds,
+        epsilon_tolerance_scale = args.epsilon_tolerance_scale,
+        inputs_embeds = inputs_embeds,
         target_probabilities = args.target_probabilities,
         attention_mask = mock_tokenization['attention_mask'],
-        position_ids = mock_tokenization['position_ids'],
+        #position_ids = mock_tokenization['position_ids'],
         gradient_masks = gradient_masks
     )
 
@@ -106,7 +116,7 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
     target_probabilities = torch.tensor(args.target_probabilities, device = device)
     gradient_masks = torch.tensor(args.gradient_masks, dtype=torch.float, device = device).unsqueeze(-1)
     attention_mask = torch.tensor(args.attention_mask, device = device)
-    position_ids = torch.tensor(args.position_ids, device = device)
+    #position_ids = torch.tensor(args.position_ids, device = device)
     learning_rate = args.learning_rate or 1e-3
 
     model.eval()                              # inference mode
@@ -123,35 +133,57 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
     # Track previous embeddings for analysis
     previous_inputs_embeds = inputs_embeds.detach().clone()
 
+    # Initial logging
+    print("\n" + "="*80)
+    print("GRADIENT DESCENT: Converging to epsilon-level set")
+    print("="*80)
+    print(f"Batch size:      {batch_size}")
+    print(f"Target epsilon:  {args.epsilon:.2e}")
+    print(f"Learning rate:   {learning_rate:.2e}")
+    print(f"Max iterations:  {args.max_iters}")
+    print("="*80 + "\n")
+
     for t in range(args.max_iters):
         opt.zero_grad(set_to_none=True)
-        with torch.autocast("mps", dtype=torch.float16):
+        with autocast():
             logits = model(
                 attention_mask = attention_mask,
-                position_ids = position_ids,
+                #position_ids = position_ids,
                 inputs_embeds=inputs_embeds).logits[:, -1, :]
 
             # Compute per-example KL divergence
-            # To verify: is the last dimension prior to .sum(dim=-1) actual vocab dim?
             kl_per_example = F.kl_div(F.log_softmax(logits, -1), target_probabilities, reduction='none').sum(dim=-1)
-            print(kl_per_example.shape)
 
-            # Overall loss for backward pass (only for logging/backward)
-            loss = kl_per_example.mean()
+            # Loss: squared distance from epsilon (directly optimize for KL ≈ epsilon)
+            # This eliminates the need for binary search refinement
+            kl_diff_per_example = torch.abs(kl_per_example - args.epsilon)
+
+        # Check convergence FIRST, before backward/step (in no_grad for efficiency)
+        with torch.no_grad():
+            # Converged = within tolerance of epsilon
+            tolerance = args.epsilon * args.epsilon_tolerance_scale
+            converged_mask = kl_diff_per_example < tolerance
+            active_examples = active_examples & (~converged_mask)
+
+        # Compute loss ONLY over active examples to avoid ADAM state being influenced
+        # by converged examples with near-zero loss
+        if active_examples.any():
+            loss = (kl_diff_per_example[active_examples] ** 2).mean()
+        else:
+            # All converged - doesn't matter, but compute something for logging
+            loss = (kl_diff_per_example ** 2).mean()
 
         scaler.scale(loss).backward()
         inputs_embeds.grad.mul_(gradient_masks)           # mask specials
 
-        # Zero out gradients for examples below epsilon
+        # Zero out gradients for inactive examples
         with torch.no_grad():
-            below_epsilon = kl_per_example < args.epsilon
-            active_examples = active_examples & (~below_epsilon)
-
             # Create per-example mask (batch_size, 1, 1) to mask all tokens in frozen examples
             example_mask = active_examples.float().view(batch_size, 1, 1)
             inputs_embeds.grad.mul_(example_mask)
 
-        # Save previous embeddings before update (only for active examples)
+        # Save embeddings BEFORE step (for active examples that will take this step)
+        # After the step, these might have converged, so this captures the "previous" state
         with torch.no_grad():
             if active_examples.any():
                 previous_inputs_embeds[active_examples] = inputs_embeds.detach()[active_examples].clone()
@@ -159,168 +191,87 @@ def learn_embeddings(args : BatchArgs) -> LearnEmbeddingsResult:
         scaler.step(opt)
         scaler.update()
 
-        # lightweight logging every 10 iters
+        # Detailed logging every 10 iters
         if t % 10 == 0:
-            torch.mps.synchronize()
+            synchronize()
             num_active = active_examples.sum().item()
-            print(f"step {t:4d}   loss {loss.item():.4f}   active: {num_active}/{batch_size}   ({(time.time() - ts)/10:.2f} seconds per step)")
+            num_converged = batch_size - num_active
+
+            # Log KL and distance from epsilon
+            if active_examples.any():
+                kl_stats = kl_per_example[active_examples]
+                kl_diff_stats = kl_diff_per_example[active_examples]
+            else:
+                kl_stats = kl_per_example
+                kl_diff_stats = kl_diff_per_example
+
+            kl_min = kl_stats.min().item() if kl_stats.numel() > 0 else 0.0
+            kl_median = kl_stats.median().item() if kl_stats.numel() > 0 else 0.0
+            kl_max = kl_stats.max().item() if kl_stats.numel() > 0 else 0.0
+
+            kl_diff_mean = kl_diff_stats.mean().item() if kl_diff_stats.numel() > 0 else 0.0
+            kl_diff_max = kl_diff_stats.max().item() if kl_diff_stats.numel() > 0 else 0.0
+
+            time_per_step = (time.time() - ts) / 10
+
+            print(f"Step {t:4d} │ Loss: {loss.item():.4f} │ "
+                  f"KL [min/med/max]: [{kl_min:.2e}/{kl_median:.2e}/{kl_max:.2e}] │ "
+                  f"|KL-ε| [mean/max]: [{kl_diff_mean:.2e}/{kl_diff_max:.2e}] │ "
+                  f"Active: {num_active}/{batch_size} │ "
+                  f"Converged: {num_converged} │ "
+                  f"{time_per_step:.2f}s/step")
             ts = time.time()
 
         # occasional allocator clean-up
         if t % 100 == 0:
-            torch.mps.empty_cache()
+            empty_cache()
 
-        # Early termination when all examples are below epsilon
+        # Early termination when all examples converged
         if not active_examples.any():
-            print(f"Early termination at step {t}: all examples below epsilon={args.epsilon}")
+            print(f"\n✓ Early termination at step {t}: all examples converged (|KL - ε| < tolerance)")
             break
 
-    # Refinement pass to get closer to epsilon-level set
-    print("Refining converged (KL < epsilon) embeddings to epsilon-level set...")
-
+    # Final gradient descent summary
+    print("\n" + "-"*80)
+    print("OPTIMIZATION COMPLETE")
     converged = ~active_examples
-    refined_embeds, refined = refine_to_epsilon_level_set(
-        model=model,
-        previous_embeds=previous_inputs_embeds,
-        final_embeds=inputs_embeds.detach(),
-        target_probs=target_probabilities,
-        epsilon=args.epsilon,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        converged = converged
-    )
+    num_converged = converged.sum().item()
+    print(f"Converged examples: {num_converged}/{batch_size} ({100*num_converged/batch_size:.1f}%)")
+    if num_converged < batch_size:
+        print(f"Non-converged:      {batch_size - num_converged}/{batch_size}")
+
+    # Final statistics
+    with torch.no_grad():
+        with autocast():
+            final_logits = model(
+                attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds
+            ).logits[:, -1, :]
+            final_kl = F.kl_div(
+                F.log_softmax(final_logits, -1),
+                target_probabilities,
+                reduction='none'
+            ).sum(dim=-1)
+            final_kl_diff = torch.abs(final_kl - args.epsilon)
+
+    print(f"\nFinal KL statistics relative to epsilon ({args.epsilon:.2e}):")
+    print(f"  Mean |KL - ε|:     {final_kl_diff.mean().item():.2e}")
+    print(f"  Median |KL - ε|:   {final_kl_diff.median().item():.2e}")
+    print(f"  Max |KL - ε|:      {final_kl_diff.max().item():.2e}")
+    print(f"  Min |KL - ε|:      {final_kl_diff.min().item():.2e}")
+
+    tolerance = args.epsilon * args.epsilon_tolerance_scale
+    success_indicators = final_kl_diff < tolerance
+    num_successful = success_indicators.sum().item()
+    print(f"\nSuccess rate: {num_successful}/{batch_size} ({100*num_successful/batch_size:.1f}%) within tolerance")
+    print("-"*80 + "\n")
 
     return LearnEmbeddingsResult(
-        inputs_embeds = inputs_embeds.detach().clone().cpu().numpy(),
-        previous_inputs_embeds = previous_inputs_embeds.detach().clone().cpu().numpy(),
-        refined_embeds = refined_embeds.detach().clone().cpu().numpy(),
-        converged = converged.cpu().numpy(),
-        refinement_success = refined.cpu().numpy()
+        starting_inputs_embeds = args.inputs_embeds[:,1,:].detach().clone().cpu().numpy(),
+        inputs_embeds = inputs_embeds[:,1,:].detach().clone().cpu().numpy(),
+        converged = converged.cpu().numpy()
     )
 
-
-def refine_to_epsilon_level_set(
-    model,
-    previous_embeds,
-    final_embeds,
-    target_probs,
-    epsilon,
-    attention_mask,
-    position_ids,
-    max_iters=20,
-    tolerance=None,
-    converged=None
-):
-    """Binary search between previous and final embeddings to find KL ≈ epsilon.
-
-    Args:
-        model: The language model
-        previous_embeds: Embeddings before final step (likely KL >= epsilon)
-        final_embeds: Embeddings after final step (likely KL < epsilon)
-        target_probs: Target probability distributions
-        epsilon: Target KL divergence threshold
-        attention_mask: Attention mask for the model
-        position_ids: Position IDs for the model
-        max_iters: Maximum binary search iterations per example
-        tolerance: Convergence tolerance for KL divergence
-        converged: Boolean tensor indicating which examples converged (optional)
-
-    Returns:
-        Tuple of (refined_embeds, success_indicators) where success_indicators
-        is a boolean tensor indicating which examples met the threshold
-    """
-
-    if tolerance is None:
-        tolerance = epsilon / 1000
-
-    batch_size = final_embeds.shape[0]
-    refined_embeds = final_embeds.clone()
-
-    # Only refine examples that converged
-    if converged is None:
-        converged = torch.ones(batch_size, dtype=torch.bool, device=final_embeds.device)
-
-    examples_to_refine = torch.where(converged)[0]
-
-    for batch_idx in examples_to_refine:
-        # Binary search for interpolation parameter α
-        alpha_low, alpha_high = 0.0, 1.0  # 0=final, 1=previous
-        best_alpha = 0.0
-        best_kl_diff = float('inf')
-
-        for iter_num in range(max_iters):
-            alpha = (alpha_low + alpha_high) / 2.0
-
-            # Interpolate: α=0 gives final_embeds, α=1 gives previous_embeds
-            candidate = (1 - alpha) * final_embeds[batch_idx:batch_idx+1] + alpha * previous_embeds[batch_idx:batch_idx+1]
-
-            with torch.no_grad():
-                logits = model(
-                    attention_mask=attention_mask[batch_idx:batch_idx+1],
-                    position_ids=position_ids[batch_idx:batch_idx+1],
-                    inputs_embeds=candidate
-                ).logits[:, -1, :]
-
-                kl = F.kl_div(
-                    F.log_softmax(logits, -1),
-                    target_probs[batch_idx:batch_idx+1],
-                    reduction='none'
-                ).sum(dim=-1).item()
-
-            kl_diff = abs(kl - epsilon)
-
-            # Track best candidate
-            if kl_diff < best_kl_diff:
-                best_kl_diff = kl_diff
-                best_alpha = alpha
-
-            # Check convergence
-            if kl_diff < tolerance:
-                if batch_idx == 0 or batch_idx == batch_size - 1:  # Log first and last
-                    print(f"  Example {batch_idx}: converged at iter {iter_num}, KL={kl:.2e}, target={epsilon:.2e}")
-                break
-
-            # Binary search logic
-            if kl < epsilon:
-                # Need to move toward previous_embeds (increase α)
-                alpha_low = alpha
-            else:
-                # Need to move toward final_embeds (decrease α)
-                alpha_high = alpha
-        else:
-            # Max iterations reached, use best candidate
-            alpha = best_alpha
-            if batch_idx == 0 or batch_idx == batch_size - 1:
-                print(f"  Example {batch_idx}: max iters reached, best KL diff={best_kl_diff:.2e}")
-
-        # Apply best interpolation
-        refined_embeds[batch_idx] = ((1 - alpha) * final_embeds[batch_idx] + alpha * previous_embeds[batch_idx])
-
-    # Final forward pass to compute success indicators for all examples at once
-    print("Computing final KL divergences for all examples...")
-    with torch.no_grad():
-        logits = model(
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            inputs_embeds=refined_embeds
-        ).logits[:, -1, :]
-
-        final_kl = F.kl_div(
-            F.log_softmax(logits, -1),
-            target_probs,
-            reduction='none'
-        ).sum(dim=-1)
-
-        # Success indicator: abs(kl - epsilon) < tolerance
-        success_indicators = torch.abs(final_kl - epsilon) < tolerance
-
-        # Log summary
-        num_successful = success_indicators.sum().item()
-        print(f"  Refinement summary: {num_successful}/{batch_size} examples met threshold")
-        print(f"  Mean KL diff from epsilon: {torch.abs(final_kl - epsilon).mean().item():.2e}")
-        print(f"  Max KL diff from epsilon: {torch.abs(final_kl - epsilon).max().item():.2e}")
-
-    return refined_embeds, success_indicators
 
 
 def timer(func):
@@ -386,7 +337,7 @@ def fit_gaussian_ellipse_and_sample(
             ellipse_sample = mean + eigenvectors @ (scaled_radii * unit_sample)
             samples.append(ellipse_sample)
 
-    return np.array(samples)
+    return np.array(samples).astype(np.float32)
 
 
 def sample_vocab_ellipse(n_samples: int, confidence_level: float = 0.99, random_seed: Optional[int] = None) -> np.ndarray:
@@ -406,3 +357,253 @@ def sample_vocab_ellipse(n_samples: int, confidence_level: float = 0.99, random_
         confidence_level=confidence_level,
         random_seed=random_seed
     )
+
+
+def compute_local_normal_vector(
+    point: np.ndarray,
+    target_probability: np.ndarray,
+    epsilon: float,
+    delta: float = 1e-3,
+    max_iters: int = 100,
+    learning_rate: float = 1e-3,
+    epsilon_tolerance_scale: float = 1e-2,
+    verbose: bool = False
+) -> np.ndarray:
+    """Compute the local normal vector at a point on the epsilon level-set using central differencing.
+
+    For each dimension, this function:
+    1. Perturbs the point by adding a small positive offset
+    2. Optimizes the perturbed point back to the epsilon level-set
+    3. Computes distance 'a' from perturbed to converged point
+    4. Perturbs the point by adding a small negative offset
+    5. Optimizes this perturbed point back to the epsilon level-set
+    6. Computes distance 'b' from perturbed to converged point
+    7. Sets the normal vector component to (b - a)
+
+    The resulting vector is then normalized.
+
+    Args:
+        point: Point on the epsilon level-set, shape (embedding_dim,)
+        target_probability: Target probability distribution, shape (vocab_size,)
+        epsilon: The epsilon value defining the level-set
+        delta: Small offset for perturbation (default: 1e-3)
+        max_iters: Maximum optimization iterations (default: 100)
+        learning_rate: Learning rate for optimization (default: 1e-3)
+        epsilon_tolerance_scale: Tolerance scale for convergence (default: 1e-2)
+        verbose: Whether to print progress (default: False)
+
+    Returns:
+        Normal vector at the point, shape (embedding_dim,), normalized to unit length
+    """
+    embedding_dim = point.shape[0]
+    normal_vector = np.zeros(embedding_dim, dtype=np.float32)
+
+    if verbose:
+        print("\n" + "="*80)
+        print("COMPUTING LOCAL NORMAL VECTOR via Central Differencing")
+        print("="*80)
+        print(f"Embedding dimension: {embedding_dim}")
+        print(f"Perturbation delta:  {delta:.2e}")
+        print(f"Target epsilon:      {epsilon:.2e}")
+        print("="*80 + "\n")
+
+    # Process each dimension
+    for dim_idx in tqdm(range(embedding_dim), desc="Computing normal components", disable=not verbose):
+
+        # === Positive perturbation ===
+        perturbed_positive = point.copy()
+        perturbed_positive[dim_idx] += delta
+
+        # Optimize positive perturbation to epsilon level-set
+        args_positive = BatchArgs(
+            inputs_embeds=perturbed_positive.reshape(1, -1),
+            target_probabilities=[target_probability],
+            max_iters=max_iters,
+            learning_rate=learning_rate,
+            epsilon=epsilon,
+            epsilon_tolerance_scale=epsilon_tolerance_scale
+        )
+
+        # Suppress output during optimization
+        import contextlib
+        import io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result_positive = learn_embeddings(args_positive)
+
+        converged_positive = result_positive.inputs_embeds[0]
+        distance_a = np.linalg.norm(perturbed_positive - converged_positive)
+
+        # === Negative perturbation ===
+        perturbed_negative = point.copy()
+        perturbed_negative[dim_idx] -= delta
+
+        # Optimize negative perturbation to epsilon level-set
+        args_negative = BatchArgs(
+            inputs_embeds=perturbed_negative.reshape(1, -1),
+            target_probabilities=[target_probability],
+            max_iters=max_iters,
+            learning_rate=learning_rate,
+            epsilon=epsilon,
+            epsilon_tolerance_scale=epsilon_tolerance_scale
+        )
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result_negative = learn_embeddings(args_negative)
+
+        converged_negative = result_negative.inputs_embeds[0]
+        distance_b = np.linalg.norm(perturbed_negative - converged_negative)
+
+        # Set normal vector component using central difference
+        normal_vector[dim_idx] = distance_b - distance_a
+
+        if verbose and dim_idx % 100 == 0:
+            print(f"Dimension {dim_idx:4d}: a={distance_a:.4e}, b={distance_b:.4e}, (b-a)={normal_vector[dim_idx]:.4e}")
+
+    # Normalize the normal vector
+    norm = np.linalg.norm(normal_vector)
+
+    if norm > 0:
+        normal_vector = normal_vector / norm
+    else:
+        if verbose:
+            print("⚠ Warning: Normal vector has zero magnitude, returning zero vector")
+
+    if verbose:
+        print("\n" + "-"*80)
+        print("NORMAL VECTOR COMPUTATION COMPLETE")
+        print(f"Vector magnitude (before normalization): {norm:.4e}")
+        print(f"Normalized normal vector L2 norm:        {np.linalg.norm(normal_vector):.6f}")
+        print("-"*80 + "\n")
+
+    return normal_vector
+
+
+def compute_local_normal_vector_batched(
+    point: np.ndarray,
+    target_probability: np.ndarray,
+    epsilon: float,
+    delta: float = 1e-3,
+    max_iters: int = 100,
+    learning_rate: float = 1e-3,
+    epsilon_tolerance_scale: float = 1e-2,
+    batch_size: int = 128,
+    verbose: bool = True
+) -> np.ndarray:
+    """Compute the local normal vector using central differencing with batched optimization.
+
+    This is a more efficient version of compute_local_normal_vector that processes multiple
+    dimensions simultaneously in batches, significantly reducing computation time.
+
+    Args:
+        point: Point on the epsilon level-set, shape (embedding_dim,)
+        target_probability: Target probability distribution, shape (vocab_size,)
+        epsilon: The epsilon value defining the level-set
+        delta: Small offset for perturbation (default: 1e-3)
+        max_iters: Maximum optimization iterations (default: 100)
+        learning_rate: Learning rate for optimization (default: 1e-3)
+        epsilon_tolerance_scale: Tolerance scale for convergence (default: 1e-2)
+        batch_size: Number of dimensions to process simultaneously (default: 128)
+        verbose: Whether to print progress (default: True)
+
+    Returns:
+        Normal vector at the point, shape (embedding_dim,), normalized to unit length
+    """
+    embedding_dim = point.shape[0]
+    normal_vector = np.zeros(embedding_dim, dtype=np.float32)
+
+    if verbose:
+        print("\n" + "="*80)
+        print("COMPUTING LOCAL NORMAL VECTOR via Batched Central Differencing")
+        print("="*80)
+        print(f"Embedding dimension: {embedding_dim}")
+        print(f"Perturbation delta:  {delta:.2e}")
+        print(f"Target epsilon:      {epsilon:.2e}")
+        print(f"Batch size:          {batch_size}")
+        print("="*80 + "\n")
+
+    # Process dimensions in batches
+    num_batches = (embedding_dim + batch_size - 1) // batch_size
+
+    for batch_idx in tqdm(range(num_batches), desc="Processing dimension batches", disable=not verbose):
+        start_dim = batch_idx * batch_size
+        end_dim = min((batch_idx + 1) * batch_size, embedding_dim)
+        current_batch_size = end_dim - start_dim
+
+        # Create perturbations for this batch
+        # For each dimension in the batch, we need both positive and negative perturbations
+        perturbed_points = []
+
+        for dim_idx in range(start_dim, end_dim):
+            # Positive perturbation
+            perturbed_pos = point.copy()
+            perturbed_pos[dim_idx] += delta
+            perturbed_points.append(perturbed_pos)
+
+            # Negative perturbation
+            perturbed_neg = point.copy()
+            perturbed_neg[dim_idx] -= delta
+            perturbed_points.append(perturbed_neg)
+
+        perturbed_points = np.array(perturbed_points)  # Shape: (2*current_batch_size, embedding_dim)
+
+        # Prepare target probabilities for the batch
+        target_probs_batch = [target_probability] * (2 * current_batch_size)
+
+        # Optimize all perturbations in this batch simultaneously
+        args_batch = BatchArgs(
+            inputs_embeds=perturbed_points,
+            target_probabilities=target_probs_batch,
+            max_iters=max_iters,
+            learning_rate=learning_rate,
+            epsilon=epsilon,
+            epsilon_tolerance_scale=epsilon_tolerance_scale
+        )
+
+        # Suppress output during optimization
+        import contextlib
+        import io
+
+        if not verbose:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result_batch = learn_embeddings(args_batch)
+        else:
+            print(f"\nBatch {batch_idx + 1}/{num_batches}: Optimizing dimensions {start_dim} to {end_dim-1}")
+            result_batch = learn_embeddings(args_batch)
+
+        converged_points = result_batch.inputs_embeds  # Shape: (2*current_batch_size, embedding_dim)
+
+        # Compute normal vector components for this batch
+        for i, dim_idx in enumerate(range(start_dim, end_dim)):
+            pos_idx = 2 * i
+            neg_idx = 2 * i + 1
+
+            # Distance from positive perturbation to its converged point
+            distance_a = np.linalg.norm(perturbed_points[pos_idx] - converged_points[pos_idx])
+
+            # Distance from negative perturbation to its converged point
+            distance_b = np.linalg.norm(perturbed_points[neg_idx] - converged_points[neg_idx])
+
+            # Central difference
+            normal_vector[dim_idx] = distance_b - distance_a
+
+            if verbose and batch_idx == 0 and i < 5:
+                print(f"  Dimension {dim_idx:4d}: a={distance_a:.4e}, b={distance_b:.4e}, (b-a)={normal_vector[dim_idx]:.4e}")
+
+    # Normalize the normal vector
+    norm = np.linalg.norm(normal_vector)
+
+    if norm > 0:
+        normal_vector = normal_vector / norm
+    else:
+        if verbose:
+            print("⚠ Warning: Normal vector has zero magnitude, returning zero vector")
+
+    if verbose:
+        print("\n" + "-"*80)
+        print("BATCHED NORMAL VECTOR COMPUTATION COMPLETE")
+        print(f"Vector magnitude (before normalization): {norm:.4e}")
+        print(f"Normalized normal vector L2 norm:        {np.linalg.norm(normal_vector):.6f}")
+        print("-"*80 + "\n")
+
+    return normal_vector
